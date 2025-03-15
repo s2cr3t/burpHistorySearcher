@@ -1,4 +1,5 @@
 # Burp Repeater Search 插件
+![图片](https://github.com/user-attachments/assets/a89a894f-b3f0-4cd4-ae4e-a3af64cded7c)
 
 ## 简介
 
@@ -46,3 +47,4 @@
 ---
 
 **注意**：本插件仅供安全研究和测试用途，请遵守当地法律法规，严禁用于非法目的。
+
