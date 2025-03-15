@@ -3,6 +3,7 @@ package org.repeaterSearch;
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.extension.ExtensionUnloadingHandler;
+import burp.api.montoya.http.message.HttpHeader;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.message.responses.HttpResponse;
@@ -69,11 +70,54 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
 
     private class RepeaterMessageCapture implements HttpHandler {
         private final Map<String, HttpRequestResponse> repeaterRequests = new ConcurrentHashMap<>();
+        private final Map<String, String> responseCharsets = new ConcurrentHashMap<>();
 
         public Map<String, HttpRequestResponse> getRepeaterRequests() {
             return repeaterRequests;
         }
 
+        public Map<String, String> getRequestCharsets() {
+            return requestCharsets;
+        }
+
+        public Map<String, String> getResponseCharsets() {
+            return responseCharsets;
+        }
+        private String determineCharset(List<HttpHeader> headers) {
+            for (HttpHeader header : headers) {
+                if (header.name().equalsIgnoreCase("Content-Type")) {
+                    String value = header.value();
+                    int charsetIndex = value.toLowerCase().indexOf("charset=");
+                    if (charsetIndex >= 0) {
+                        String charset = value.substring(charsetIndex + 8).trim();
+                        if (charset.startsWith("\"") && charset.endsWith("\"")) {
+                            charset = charset.substring(1, charset.length() - 1);
+                        }
+                        int semicolonIndex = charset.indexOf(';');
+                        if (semicolonIndex > 0) {
+                            charset = charset.substring(0, semicolonIndex);
+                        }
+                        return charset;
+                    }
+                }
+            }
+
+            if (doesHeaderContain(headers, "Content-Type", "text/html") ||
+                    doesHeaderContain(headers, "Content-Type", "application/xml")) {
+                return "UTF-8";
+            }
+
+            return "UTF-8";
+        }
+        private boolean doesHeaderContain(List<HttpHeader> headers, String headerName, String containsValue) {
+            for (HttpHeader header : headers) {
+                if (header.name().equalsIgnoreCase(headerName) &&
+                        header.value().toLowerCase().contains(containsValue.toLowerCase())) {
+                    return true;
+                }
+            }
+            return false;
+        }
         @Override
         public burp.api.montoya.http.handler.RequestToBeSentAction handleHttpRequestToBeSent(burp.api.montoya.http.handler.HttpRequestToBeSent requestToBeSent) {
             try {
@@ -93,12 +137,18 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     }
 
                     if (request != null) {
+                        String charset = determineCharset(request.headers());
+
+                        api.logging().logToOutput("请求使用的字符集: " + charset);
+
                         String requestId = generateRequestId(request);
 
                         repeaterRequests.put(requestId, HttpRequestResponse.httpRequestResponse(
                                 request,
                                 null
                         ));
+
+                        requestCharsets.put(requestId, charset);
 
                         api.logging().logToOutput("捕获来自Repeater的请求: " + request.url());
                     }
@@ -143,6 +193,11 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
 
                     if (initiatingRequest != null && response != null) {
                         String requestId = generateRequestId(initiatingRequest);
+
+                        String charset = determineCharset(response.headers());
+                        api.logging().logToOutput("响应使用的字符集: " + charset);
+
+                        responseCharsets.put(requestId, charset);
 
                         if (repeaterRequests.containsKey(requestId)) {
                             repeaterRequests.put(requestId, HttpRequestResponse.httpRequestResponse(
@@ -355,6 +410,12 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
             return;
         }
 
+        StringBuilder hexString = new StringBuilder();
+        for (byte b : keyword.getBytes(java.nio.charset.StandardCharsets.UTF_8)) {
+            hexString.append(String.format("%02x ", b & 0xff));
+        }
+        api.logging().logToOutput("搜索关键词: '" + keyword + "', 十六进制: " + hexString.toString());
+
         boolean searchRequest = searchRequestCheckbox.isSelected();
         boolean searchResponse = searchResponseCheckbox.isSelected();
         boolean caseSensitive = caseSensitiveCheckbox.isSelected();
@@ -377,6 +438,11 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
         statusLabel.setText("正在搜索...");
 
         searchResults.clear();
+        tableModel.setRowCount(0);
+
+        this.searchKeyword = keyword;
+        this.isCaseSensitive = caseSensitive;
+        this.isRegex = useRegex;
 
         SwingWorker<List<SearchResultData>, Void> worker = new SwingWorker<>() {
             @Override
@@ -424,6 +490,7 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     }
                 } catch (Exception e) {
                     api.logging().logToError("处理搜索结果时出错: " + e.getMessage());
+                    e.printStackTrace();
                     statusLabel.setText("搜索出错");
                 }
             }
@@ -462,7 +529,17 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     }
 
                     if (searchRequest) {
-                        String requestString = request.toString();
+                        String requestCharset = messageCapture.determineCharset(request.headers());
+
+                        byte[] requestBytes = request.toByteArray().getBytes();
+                        String requestString;
+
+                        try {
+                            requestString = new String(requestBytes, requestCharset);
+                        } catch (Exception e) {
+                            requestString = request.toString();
+                        }
+
                         List<String> matches = findMatches(requestString, keyword, caseSensitive, useRegex);
 
                         if (!matches.isEmpty()) {
@@ -473,7 +550,17 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     }
 
                     if (searchResponse && proxyReqRes.response() != null) {
-                        String responseString = proxyReqRes.response().toString();
+                        String responseCharset = messageCapture.determineCharset(proxyReqRes.response().headers());
+
+                        byte[] responseBytes = proxyReqRes.response().toByteArray().getBytes();
+                        String responseString;
+
+                        try {
+                            responseString = new String(responseBytes, responseCharset);
+                        } catch (Exception e) {
+                            responseString = proxyReqRes.response().toString();
+                        }
+
                         List<String> matches = findMatches(responseString, keyword, caseSensitive, useRegex);
 
                         if (!matches.isEmpty()) {
@@ -501,10 +588,14 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
 
         try {
             Map<String, HttpRequestResponse> repeaterRequests = messageCapture.getRepeaterRequests();
+            Map<String, String> requestCharsets = messageCapture.getRequestCharsets();
+            Map<String, String> responseCharsets = messageCapture.getResponseCharsets();
+
             api.logging().logToOutput("开始搜索Repeater内容，当前缓存中有 " + repeaterRequests.size() + " 个请求/响应");
 
             for (Map.Entry<String, HttpRequestResponse> entry : repeaterRequests.entrySet()) {
                 try {
+                    String requestId = entry.getKey();
                     HttpRequestResponse reqRes = entry.getValue();
                     if (reqRes == null) continue;
 
@@ -512,11 +603,21 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     if (request == null) continue;
 
                     String url = request.url();
-
                     String timestamp = formatTimestamp(System.currentTimeMillis());
 
+                    String requestCharset = requestCharsets.getOrDefault(requestId, "UTF-8");
+                    String responseCharset = responseCharsets.getOrDefault(requestId, "UTF-8");
+
                     if (searchRequest) {
-                        String requestString = request.toString();
+                        byte[] requestBytes = request.toByteArray().getBytes();
+                        String requestString;
+
+                        try {
+                            requestString = new String(requestBytes, requestCharset);
+                        } catch (Exception e) {
+                            requestString = request.toString();
+                        }
+
                         List<String> matches = findMatches(requestString, keyword, caseSensitive, useRegex);
 
                         if (!matches.isEmpty()) {
@@ -527,7 +628,15 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     }
 
                     if (searchResponse && reqRes.response() != null) {
-                        String responseString = reqRes.response().toString();
+                        byte[] responseBytes = reqRes.response().toByteArray().getBytes();
+                        String responseString;
+
+                        try {
+                            responseString = new String(responseBytes, responseCharset);
+                        } catch (Exception e) {
+                            responseString = reqRes.response().toString();
+                        }
+
                         List<String> matches = findMatches(responseString, keyword, caseSensitive, useRegex);
 
                         if (!matches.isEmpty()) {
@@ -573,43 +682,109 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
         List<String> matches = new ArrayList<>();
 
         try {
+            if (text == null) text = "";
+
+            api.logging().logToOutput("搜索文本长度: " + text.length() + ", 关键词: '" + keyword + "'");
+
             if (useRegex) {
                 int flags = caseSensitive ? 0 : Pattern.CASE_INSENSITIVE;
-                Pattern pattern = Pattern.compile(keyword, flags);
-                Matcher matcher = pattern.matcher(text);
+                flags |= Pattern.UNICODE_CASE;
+                flags |= Pattern.UNICODE_CHARACTER_CLASS;
 
-                while (matcher.find()) {
-                    int start = Math.max(0, matcher.start() - 20);
-                    int end = Math.min(text.length(), matcher.end() + 20);
-                    String context = text.substring(start, end);
+                try {
+                    Pattern pattern = Pattern.compile(keyword, flags);
+                    Matcher matcher = pattern.matcher(text);
 
-                    if (start > 0) context = "..." + context;
-                    if (end < text.length()) context = context + "...";
+                    while (matcher.find()) {
+                        int start = Math.max(0, matcher.start() - 20);
+                        int end = Math.min(text.length(), matcher.end() + 20);
+                        String context = text.substring(start, end);
 
-                    matches.add(context);
-                }
-            } else {
-                String searchText = caseSensitive ? text : text.toLowerCase();
-                String searchKeyword = caseSensitive ? keyword : keyword.toLowerCase();
+                        if (start > 0) context = "..." + context;
+                        if (end < text.length()) context = context + "...";
 
-                int index = 0;
-                while ((index = searchText.indexOf(searchKeyword, index)) != -1) {
-                    int start = Math.max(0, index - 20);
-                    int end = Math.min(text.length(), index + searchKeyword.length() + 20);
-                    String context = text.substring(start, end);
-
-                    if (start > 0) context = "..." + context;
-                    if (end < text.length()) context = context + "...";
-
-                    matches.add(context);
-                    index += searchKeyword.length();
+                        api.logging().logToOutput("找到正则匹配: '" + matcher.group() + "'");
+                        matches.add(context);
+                    }
+                } catch (Exception e) {
+                    api.logging().logToError("正则表达式错误: " + e.getMessage());
+                    useRegex = false;
                 }
             }
+
+            if (!useRegex) {
+                if (!caseSensitive) {
+                    String normalizedText = java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFD).toLowerCase();
+                    String normalizedKeyword = java.text.Normalizer.normalize(keyword, java.text.Normalizer.Form.NFD).toLowerCase();
+
+                    int index = 0;
+                    while (index < normalizedText.length()) {
+                        index = normalizedText.indexOf(normalizedKeyword, index);
+                        if (index == -1) break;
+
+                        int start = Math.max(0, index - 20);
+                        int end = Math.min(text.length(), index + normalizedKeyword.length() + 20);
+                        String context = text.substring(start, end);
+
+                        if (start > 0) context = "..." + context;
+                        if (end < text.length()) context = context + "...";
+
+                        api.logging().logToOutput("找到普通匹配: 位置 " + index);
+                        matches.add(context);
+
+                        index += normalizedKeyword.length();
+                    }
+                } else {
+                    int index = 0;
+                    while (index < text.length()) {
+                        index = text.indexOf(keyword, index);
+                        if (index == -1) break;
+
+                        int start = Math.max(0, index - 20);
+                        int end = Math.min(text.length(), index + keyword.length() + 20);
+                        String context = text.substring(start, end);
+
+                        if (start > 0) context = "..." + context;
+                        if (end < text.length()) context = context + "...";
+
+                        api.logging().logToOutput("找到区分大小写匹配: 位置 " + index);
+                        matches.add(context);
+
+                        index += keyword.length();
+                    }
+                }
+            }
+
+            api.logging().logToOutput("找到匹配数: " + matches.size());
         } catch (Exception e) {
             api.logging().logToError("搜索匹配时出错: " + e.getMessage());
+            e.printStackTrace();
         }
 
         return matches;
+    }
+    /**
+     * Find a valid string boundary that doesn't break Unicode characters
+     * @param text The text to search in
+     * @param position The initial position
+     * @param forward True to search forward, false to search backward
+     * @return A valid string position that doesn't break Unicode characters
+     */
+    private int findValidStringBoundary(String text, int position, boolean forward) {
+        if (position <= 0) return 0;
+        if (position >= text.length()) return text.length();
+
+        if (forward) {
+            if (position < text.length() - 1 && Character.isLowSurrogate(text.charAt(position))) {
+                return position + 1;
+            }
+        } else {
+            if (position > 0 && Character.isHighSurrogate(text.charAt(position - 1))) {
+                return position - 1;
+            }
+        }
+
+        return position;
     }
 
     private void goToRepeaterTab(int rowIndex) {
@@ -848,52 +1023,81 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                 highlightPositions.clear();
             }
 
-            int docStart = doc.getLength();
-
             if (isRegex) {
                 int flags = isCaseSensitive ? 0 : Pattern.CASE_INSENSITIVE;
-                Pattern pattern = Pattern.compile(searchKeyword, flags);
-                Matcher matcher = pattern.matcher(text);
+                flags |= Pattern.UNICODE_CASE;
+                flags |= Pattern.UNICODE_CHARACTER_CLASS;
 
-                int lastEnd = 0;
-                while (matcher.find()) {
-                    doc.insertString(doc.getLength(), text.substring(lastEnd, matcher.start()), defaultStyle);
+                try {
+                    Pattern pattern = Pattern.compile(searchKeyword, flags);
+                    Matcher matcher = pattern.matcher(text);
 
-                    int highlightStart = doc.getLength();
+                    int lastEnd = 0;
+                    while (matcher.find()) {
+                        doc.insertString(doc.getLength(), text.substring(lastEnd, matcher.start()), defaultStyle);
 
-                    doc.insertString(doc.getLength(), text.substring(matcher.start(), matcher.end()),
-                            getHighlightedStyle(defaultStyle));
+                        int highlightStart = doc.getLength();
 
-                    highlightPositions.add(new Position(highlightStart, matcher.end() - matcher.start()));
+                        doc.insertString(doc.getLength(), text.substring(matcher.start(), matcher.end()),
+                                getHighlightedStyle(defaultStyle));
 
-                    lastEnd = matcher.end();
-                }
-                if (lastEnd < text.length()) {
-                    doc.insertString(doc.getLength(), text.substring(lastEnd), defaultStyle);
+                        highlightPositions.add(new Position(highlightStart, matcher.end() - matcher.start()));
+
+                        lastEnd = matcher.end();
+                    }
+
+                    if (lastEnd < text.length()) {
+                        doc.insertString(doc.getLength(), text.substring(lastEnd), defaultStyle);
+                    }
+                } catch (Exception e) {
+                    doc.insertString(doc.getLength(), text, defaultStyle);
                 }
             } else {
-                String searchFor = isCaseSensitive ? searchKeyword : searchKeyword.toLowerCase();
-                String textToSearch = isCaseSensitive ? text : text.toLowerCase();
+                if (!isCaseSensitive) {
+                    String normalizedText = java.text.Normalizer.normalize(text, java.text.Normalizer.Form.NFD).toLowerCase();
+                    String normalizedKeyword = java.text.Normalizer.normalize(searchKeyword, java.text.Normalizer.Form.NFD).toLowerCase();
 
-                int searchIndex = 0;
-                int lastIndex = 0;
+                    int lastIndex = 0;
+                    int searchIndex = 0;
 
-                while ((searchIndex = textToSearch.indexOf(searchFor, searchIndex)) != -1) {
-                    doc.insertString(doc.getLength(), text.substring(lastIndex, searchIndex), defaultStyle);
+                    while ((searchIndex = normalizedText.indexOf(normalizedKeyword, searchIndex)) != -1) {
+                        doc.insertString(doc.getLength(), text.substring(lastIndex, searchIndex), defaultStyle);
 
-                    int highlightStart = doc.getLength();
+                        int highlightStart = doc.getLength();
 
-                    doc.insertString(doc.getLength(), text.substring(searchIndex, searchIndex + searchFor.length()),
-                            getHighlightedStyle(defaultStyle));
+                        doc.insertString(doc.getLength(), text.substring(searchIndex, searchIndex + searchKeyword.length()),
+                                getHighlightedStyle(defaultStyle));
 
-                    highlightPositions.add(new Position(highlightStart, searchFor.length()));
+                        highlightPositions.add(new Position(highlightStart, searchKeyword.length()));
 
-                    searchIndex += searchFor.length();
-                    lastIndex = searchIndex;
-                }
+                        searchIndex += normalizedKeyword.length();
+                        lastIndex = searchIndex;
+                    }
 
-                if (lastIndex < text.length()) {
-                    doc.insertString(doc.getLength(), text.substring(lastIndex), defaultStyle);
+                    if (lastIndex < text.length()) {
+                        doc.insertString(doc.getLength(), text.substring(lastIndex), defaultStyle);
+                    }
+                } else {
+                    int lastIndex = 0;
+                    int searchIndex = 0;
+
+                    while ((searchIndex = text.indexOf(searchKeyword, searchIndex)) != -1) {
+                        doc.insertString(doc.getLength(), text.substring(lastIndex, searchIndex), defaultStyle);
+
+                        int highlightStart = doc.getLength();
+
+                        doc.insertString(doc.getLength(), text.substring(searchIndex, searchIndex + searchKeyword.length()),
+                                getHighlightedStyle(defaultStyle));
+
+                        highlightPositions.add(new Position(highlightStart, searchKeyword.length()));
+
+                        searchIndex += searchKeyword.length();
+                        lastIndex = searchIndex;
+                    }
+
+                    if (lastIndex < text.length()) {
+                        doc.insertString(doc.getLength(), text.substring(lastIndex), defaultStyle);
+                    }
                 }
             }
         }
@@ -940,6 +1144,7 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
 
             if (isRegex) {
                 int flags = isCaseSensitive ? 0 : Pattern.CASE_INSENSITIVE;
+                flags |= Pattern.UNICODE_CHARACTER_CLASS;
                 Pattern pattern = Pattern.compile(searchKeyword, flags);
                 Matcher matcher = pattern.matcher(text);
 
@@ -1015,6 +1220,10 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
     }
 
 
+
+
+    private final Map<String, String> requestCharsets = new ConcurrentHashMap<>();
+
     private void showRequestResponseDetails() {
         int selectedRow = resultsTable.getSelectedRow();
         if (selectedRow >= 0 && selectedRow < searchResults.size()) {
@@ -1031,7 +1240,16 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
             if (data.proxyRequestResponse != null) {
                 HttpRequest request = data.proxyRequestResponse.request();
                 if (request != null) {
-                    requestHighlighter.highlightHttpContent(requestTextPane, request.toString(), true);
+                    String requestCharset = messageCapture.determineCharset(request.headers());
+
+                    try {
+                        byte[] requestBytes = request.toByteArray().getBytes();
+                        String requestString = new String(requestBytes, requestCharset);
+                        requestHighlighter.highlightHttpContent(requestTextPane, requestString, true);
+                    } catch (Exception e) {
+                        requestHighlighter.highlightHttpContent(requestTextPane, request.toString(), true);
+                    }
+
                     if ("请求".equals(data.matchLocation)) {
                         requestHighlighter.scrollToFirstHighlight(requestTextPane);
                     }
@@ -1041,7 +1259,16 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
 
                 HttpResponse response = data.proxyRequestResponse.response();
                 if (response != null) {
-                    responseHighlighter.highlightHttpContent(responseTextPane, response.toString(), false);
+                    String responseCharset = messageCapture.determineCharset(response.headers());
+
+                    try {
+                        byte[] responseBytes = response.toByteArray().getBytes();
+                        String responseString = new String(responseBytes, responseCharset);
+                        responseHighlighter.highlightHttpContent(responseTextPane, responseString, false);
+                    } catch (Exception e) {
+                        responseHighlighter.highlightHttpContent(responseTextPane, response.toString(), false);
+                    }
+
                     if ("响应".equals(data.matchLocation)) {
                         responseHighlighter.scrollToFirstHighlight(responseTextPane);
                     }
@@ -1049,25 +1276,6 @@ public class BurpRepeaterSearchExtension implements BurpExtension, ExtensionUnlo
                     responseTextPane.setText("");
                 }
             } else if (data.repeaterRequestResponse != null) {
-                HttpRequest request = data.repeaterRequestResponse.request();
-                if (request != null) {
-                    requestHighlighter.highlightHttpContent(requestTextPane, request.toString(), true);
-                    if ("请求".equals(data.matchLocation)) {
-                        requestHighlighter.scrollToFirstHighlight(requestTextPane);
-                    }
-                } else {
-                    requestTextPane.setText("");
-                }
-
-                HttpResponse response = data.repeaterRequestResponse.response();
-                if (response != null) {
-                    responseHighlighter.highlightHttpContent(responseTextPane, response.toString(), false);
-                    if ("响应".equals(data.matchLocation)) {
-                        responseHighlighter.scrollToFirstHighlight(responseTextPane);
-                    }
-                } else {
-                    responseTextPane.setText("");
-                }
             } else {
                 requestTextPane.setText("无法加载请求数据");
                 responseTextPane.setText("无法加载响应数据");
